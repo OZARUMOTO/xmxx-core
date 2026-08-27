@@ -1,0 +1,26 @@
+[package]
+name = "xmxx-core"
+version = "0.1.0"
+edition = "2021"
+description = "OZARUMOTO Monero reference crypto for a foundation monero-signer server: key derivation, key images, unsigned/signed tx wire formats."
+license = "GPL-3.0-or-later"
+authors = ["OZARUMOTO"]
+repository = "https://github.com/OZARUMOTO/xmxx-core"
+
+[features]
+default = []
+# `device` enables `derive_wallet_from_seed()`, which reaches the KeyOS
+# security API (`GetAppSeed`) and only compiles on-device. The pure crypto is
+# host-compilable without this feature.
+device = []
+
+[dependencies]
+sha2 = "0.10"
+curve25519-dalek = { version = "4", features = ["zeroize"] }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+hex = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
