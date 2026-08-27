@@ -4,17 +4,26 @@
 // XMXX-CORE — OZARUMOTO's Monero reference crypto.
 //
 // Extracted from the xmxx KeyOS app so it can back a foundation `monero-signer`
-// server. Pure crypto only: key derivation, key images, and the unsigned/signed
-// tx wire formats. No UI, no transport, no device state.
+// server. Pure crypto only: key derivation, key images, and the authenticated
+// unsigned/signed tx wire formats. No UI, no transport, no device state.
 //
 // The three modules map 1:1 onto a signer-server message surface:
-//   * `wallet`    → xmr-address   (seed → spend/view + verified Monero base58)
-//   * `keyimage`  → xmr-keyimage  (hash-to-point + double-spend-proof computation)
-//   * `txset`     → xmr-txunsigned / xmr-txsigned (wire format + review fields)
+//   * `wallet`    → xmr-address  (SLIP-0010 seed → spend/view + verified base58)
+//   * `keyimage`  → xmr-keyimage (one-time keys + double-spend proofs)
+//   * `txset`     → xmr-txunsigned / xmr-txsigned (authenticated wire format)
 //
-// Compile on any host with `cargo build`. The only device-coupled entry point,
-// `wallet::derive_wallet_from_seed`, is gated behind the `device` feature and
-// only builds against the KeyOS `security` crate.
+// Everything is host-compilable with `cargo build` / `cargo test`. This crate
+// is std-only: the underlying Monero stack (monero-oxide / monero-wallet) is
+// no_std-capable, but this crate does not claim no_std until it actually builds
+// that way — the `device` entry point lives in the app, which calls
+// `wallet::MoneroWallet::derive(&app_seed, account)` with the KeyOS app seed.
 pub mod wallet;
 pub mod keyimage;
 pub mod txset;
+
+mod slip10;
+mod words;
+
+// Re-export the exact scalar/point types used across the wire formats so the
+// app and companion import one set of types (from monero-oxide's ed25519).
+pub use monero_oxide::ed25519::{Point, Scalar, CompressedPoint};

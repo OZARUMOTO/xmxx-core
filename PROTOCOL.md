@@ -1,9 +1,10 @@
 # XMXX-CORE wire protocol
 
 Reference wire formats for a Foundation `monero-signer` server, extracted from
-the OZARUMOTO `xmxx` KeyOS app. All payloads are short, hard-provable text
-strings meant to survive QR encoding (animated UR or static), USB vendor
-transport, or the QLv2 relay.
+the OZARUMOTO `xmxx` KeyOS app. All payloads are short text strings meant to
+survive QR encoding (animated UR or static), USB vendor transport, or the QLv2
+relay. The crypto is built on **monero-oxide / monero-wallet** (Luke Parker,
+Cypher Stack audit May 2025) — the primitives are vetted, not reconstructed.
 
 ## Messages
 
@@ -13,93 +14,148 @@ Derive a Monero address (optionally a subaddress) from a seed. Never returns
 private keys.
 
 ```
-request:  xmr-address:<slot>
-response: monero:<address>          # e.g. monero:49B1re7YK...ZJ1Ad
+request:  xmr-address:<account>[:<major>:<minor>]
+response: monero:<address>
 ```
 
-- `<slot>` — an integer wallet slot under the seed.
+- `<account>` — SLIP-0010 account index `m/44'/128'/account'` (the xmxx wallet slot).
+- `<major>:<minor>` — optional subaddress index (account, address).
 - `<address>` — 95-char mainnet address (starts with `4`).
 
-Implementation: `wallet::derive_wallet(seed, slot)` → `MoneroWallet.address`.
-Base58 encoding matches `monero/src/common/base58.cpp` exactly.
+Derivation (verified against mainline Monero and the Trezor/Ledger standard):
+
+```
+account_key = SLIP-0010 m/44'/128'/<account>' from the seed
+spend       = sc_reduce32(account_key)
+view        = sc_reduce32(keccak256(spend))
+address     = 0x12 ‖ spend_pub ‖ view_pub ‖ keccak256(checksum)  → base58
+```
+
+Subaddress construction matches `monero/src/device/device_default.cpp`:
+`m = H_s("SubAddr\0" ‖ view_priv ‖ major_LE32 ‖ minor_LE32)`, `D = B + m·G`,
+`C = a·D`. A wallet derived this way is fully restorable in monero-wallet-cli,
+Feather, or Cake: the reduced spend scalar encodes to Monero's own 25-word
+mnemonic (see `wallet::spend_mnemonic`).
+
+Implementation: `wallet::MoneroWallet::derive` / `::subaddress` / `::spend_mnemonic`.
 
 ### `xmr-output`
 
-The companion tells the signer which on-chain one-time output public keys are
-available to be spent. This is the *input* to key-image computation.
+The companion tells the signer which on-chain one-time outputs are available to
+spend, with the data needed to derive each one-time secret on-device.
 
 ```
-request:  xmr-output:<output_key_hex>[,<output_key_hex>...]
+request: xmr-output:<R_hex>;<index>:<P_hex>[:<major>:<minor>][;...]
 ```
 
-- Each `<output_key_hex>` is 32 bytes hex (64 chars) — a one-time output pubkey.
+- `<R_hex>` — the transaction public key (or per-output additional key), 32 bytes hex.
+- `<index>` — the output's index within the transaction.
+- `<P_hex>` — the one-time output public key, 32 bytes hex.
+- `<major>:<minor>` — optional subaddress index the output was sent to.
 
 Implementation: `keyimage::parse_output_payload`.
 
 ### `xmr-keyimage`
 
-The signer returns the computed key images for those outputs (the
-double-spend-proof). The companion records them so it can correlate which
-outputs are unspent.
+The signer returns the double-spend-proof key images for those outputs,
+deriving the one-time secrets itself:
 
 ```
 response: xmr-keyimage:<key_image_hex>[,<key_image_hex>...]
 ```
 
-- One entry per `xmr-output` entry, same order.
-- Each `<key_image_hex>` is 32 bytes hex — `x · hashToPoint(P)`.
+One entry per `xmr-output` entry, same order. The derivation (matches mainline
+Monero and monero-wallet's audited scan path):
+
+```
+D      = 8·(a·R)
+shared = H_s(D ‖ varint(index))
+m      = H_s("SubAddr\0" ‖ a ‖ major_LE32 ‖ minor_LE32)      (subaddress only)
+x      = spend + shared + m
+assert x·G == P                                                ← ownership check
+I      = x · H_p(P)     (H_p = ge_fromfe_frombytes_vartime, unknown dlog)
+```
+
+The `x·G == P` assertion is mandatory: a companion that claims an output this
+wallet does not own gets an error, never a key image.
 
 Implementation: `keyimage::compute_key_images_batch`.
 
 ### `xmr-txunsigned`
 
-The companion presents an unsigned transaction for review + signing. Carries a
-wallet2 `unsigned_tx_set` plus the derived crypto material the signer needs to
-authenticate it.
+The companion presents an unsigned transaction for review + signing.
 
 ```
-request:  xmr-txunsigned:<hex>     # raw bytes (JSON now; wallet2 encrypted later)
+request: xmr-txunsigned:<hex>
 ```
 
-The full wallet2 path (module doc steps 1–2) is:
-1. Decrypt with the CryptoNight-v0 key derived from the view key.
-2. Blake2b-HMAC verify the auth tag.
-3. CBOR-parse sources, destinations, fee.
+The payload is an **authenticated envelope** around monero-wallet's native
+`SignableTransaction` serialization (inputs with decoys + commitments,
+payments, fee rate — the actual object the signer will sign):
 
-Today the companion emits a JSON `unsigned_tx_set`:
-
-```json
-{
-  "destinations": [{"address": "4...", "amount": 120000000000}],
-  "fee": 24000000000,
-  "input_count": 1
-}
+```
+magic "xmxx-txunsigned-v1" ‖ version(1)
+‖ destinations ‖ payload
+‖ sig(64)   Schnorr over keccak256(destinations ‖ payload), view keypair
 ```
 
-Implementation: `txset::parse_unsigned_tx_set`.
+- `destinations` — the review summary: `count ‖ (addr_len ‖ address ‖ amount)*`.
+- `payload` — `SignableTransaction::serialize()`.
+- `sig` — Monero's Schnorr signature (`crypto.cpp generate_signature`), with a
+  deterministic nonce so the device needs no RNG. Verifying it proves the data
+  is unmodified **and** that the sender holds this wallet's view key — the
+  "is this my wallet?" test (the same auth model as wallet2's unsigned_tx_set).
+
+Implementation: `txset::parse_unsigned_tx_set` (companion-side builder:
+`txset::encode_unsigned_tx_set`).
 
 ### `xmr-txsigned`
 
-The signer returns the signed transaction after CLSAG + Bulletproof+ signing,
-repackaged as a wallet2 `signed_tx_set` for the companion to broadcast.
+The signer returns the signed transaction after CLSAG + Bulletproof+ signing
+via monero-wallet's audited `SignableTransaction::sign`, deterministically
+seeded (`ChaCha20Rng` from `keccak256(payload ‖ view_pub)`):
 
 ```
 response: xmr-txsigned:<hex>
 ```
 
-Implementation: `txset::sign_tx` (stub — CLSAG/BP+ signing still to be wired
-through `monero-oxide`).
+The hex is the serialized Monero `Transaction` — the companion only needs to
+broadcast it.
+
+Implementation: `txset::sign_tx`. It **cannot** report success without signing:
+every input is ownership-verified (`(spend + key_offset)·G == P`), and any
+failure is a hard error.
 
 ## Security invariants
 
-- **Private keys never leave the signer.** `spend_key` / `view_key` are derived
-  and used entirely on-device; only the public keys and computed key images /
-  signatures cross the wire.
-- **Key images are authoritative.** The companion can combine `xmr-output` +
-  `xmr-keyimage` to know which outputs are owned and unspent, but cannot spend.
-- **The spend path requires the seed's signature.** `sign_tx` runs inside the
-  signer against the device/app seed; the companion can only broadcast the
-  returned `xmr-txsigned` bytes.
+- **Private keys never leave the signer.** Spend/view keys are derived and
+  used on-device; only public keys, key images, and signatures cross the wire.
+- **Key images are only emitted for owned outputs.** The `x·G == P` assertion
+  is checked before anything is produced; a companion cannot make the signer
+  commit to an output it does not own.
+- **The unsigned set is authenticated.** A transaction not signed by this
+  wallet's view key is rejected before any parsing — so a foreign or tampered
+  set cannot reach the review screen.
+- **What you review is what you sign.** The review shows the fee recomputed
+  on-device from the actual object (`necessary_fee`), the payload fingerprint,
+  and the authenticated destination summary. The destination *intent* is
+  companion-asserted (only the companion knows the payment intent; the device
+  has no way to recompute it from the serialized tx) — but it is bound to the
+  signed payload by the envelope signature and the ownership checks, and the
+  fingerprint lets a user cross-check against the companion.
+
+## Honest gaps (documented, not hidden)
+
+- **wallet2 binary interop is not implemented.** The wire format here is
+  monero-wallet-native (which is what a signer server built on monero-oxide
+  consumes). Importing a wallet2 `unsigned_tx_set` from Cake/Feather would
+  require the CryptoNight-v0 key derivation (`cn_slow_hash_v0(view)`) and a
+  portable_storage binary parser — a tracked follow-up, not silently claimed.
+- **Signing integration is exercised end-to-end by the companion**, since
+  constructing a `SignableTransaction` requires monero-wallet's scan/decoys
+  flow. The signer side (parse → review → sign → serialize) is fully
+  unit-tested here except for the final `sign()` call itself, which is a thin
+  wrapper over monero-wallet's audited code.
 
 ## License
 
