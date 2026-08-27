@@ -141,7 +141,7 @@ impl MoneroWallet {
         let a_dalek: curve25519_dalek::Scalar = (*self.view_key).into();
         let c_dalek = &a_dalek * &d_dalek;
 
-        encode_address(
+        encode_subaddress(
             &d_dalek.compress().to_bytes(),
             &c_dalek.compress().to_bytes(),
         )
@@ -169,11 +169,24 @@ fn into_dalek(p: Point) -> curve25519_dalek::EdwardsPoint {
 /// Payload: [network_version(1)=0x12] [spend_pub(32)] [view_pub(32)] =
 /// 65 bytes, then a Keccak-256 checksum of those 65 bytes truncated to 4
 /// bytes = 69 bytes, base58-encoded to 95 chars starting with `4`.
-pub(crate) fn encode_address(spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> String {
+pub fn encode_address(spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> String {
+    encode_with_network_byte(0x12, spend_pub, view_pub)
+}
+
+/// Encode a Monero mainnet SUBADDRESS from its spend/view public keys.
+///
+/// Subaddresses use network byte 0x2A (mainnet), producing the characteristic
+/// `8...` prefix — a 0x12 byte would make a wallet parse it as a standard
+/// (unspendable) address.
+pub fn encode_subaddress(spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> String {
+    encode_with_network_byte(0x2A, spend_pub, view_pub)
+}
+
+fn encode_with_network_byte(network_byte: u8, spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> String {
     use tiny_keccak::Hasher;
 
     let mut data = Vec::with_capacity(69);
-    data.push(0x12); // mainnet version byte
+    data.push(network_byte);
     data.extend_from_slice(spend_pub);
     data.extend_from_slice(view_pub);
 
@@ -187,15 +200,16 @@ pub(crate) fn encode_address(spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> Strin
     base58_encode(&data)
 }
 
-/// Validate a Monero address string (accepts an optional `monero:` prefix).
-/// Checks network byte, length and the embedded Keccak checksum.
+/// Validate a Monero mainnet address string (accepts an optional `monero:`
+/// prefix). Accepts standard (0x12) and subaddress (0x2A) network bytes;
+/// checks length and the embedded Keccak checksum.
 pub fn validate_address(addr: &str) -> bool {
     let addr = addr.strip_prefix("monero:").unwrap_or(addr);
     let Some(raw) = base58_decode(addr) else { return false };
     if raw.len() != 69 {
         return false;
     }
-    if raw[0] != 0x12 {
+    if raw[0] != 0x12 && raw[0] != 0x2A {
         return false;
     }
     use tiny_keccak::Hasher;
@@ -477,8 +491,12 @@ mod tests {
         let a_dalek: curve25519_dalek::Scalar = (*w.view_key).into();
         let c_dalek = &a_dalek * &d_dalek;
 
-        let expected = encode_address(&d_dalek.compress().to_bytes(), &c_dalek.compress().to_bytes());
+        let expected = encode_subaddress(&d_dalek.compress().to_bytes(), &c_dalek.compress().to_bytes());
         assert_eq!(sub, expected);
+        // Subaddresses must carry the 0x2A network byte (8-prefix), not 0x12.
+        let raw = base58_decode(&sub).unwrap();
+        assert_eq!(raw[0], 0x2A, "subaddress network byte");
+        assert!(sub.starts_with('8'), "mainnet subaddress starts with 8, got {}", sub);
     }
 
     /// Distinct subaddresses for different (major, minor).

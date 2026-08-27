@@ -27,3 +27,6 @@ rand_chacha = { version = "0.3", default-features = false }
 zeroize = { version = "1", features = ["derive", "alloc", "zeroize_derive"] }
 
 [dev-dependencies]
+# Independent vetted address encoder (serai) — cross-checks our base58/checksum
+# and subaddress encoding against a separate implementation.
+monero-address = "0.1"
