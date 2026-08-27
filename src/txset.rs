@@ -150,7 +150,35 @@ pub fn parse_unsigned_tx_set(
 ) -> Result<UnsignedTxSet, TxSetError> {
     let hex_data = qr_data.trim().strip_prefix("xmr-txunsigned:").unwrap_or(qr_data.trim());
     let raw = hex::decode(hex_data).map_err(|e| TxSetError::Decode(e.to_string()))?;
+    parse_envelope(&raw, view_pub)
+}
 
+/// Parse + authenticate an `xmr-txunsigned` payload passed as RAW BYTES (the
+/// Prime's QR scanner yields binary; binary envelopes are also far more
+/// space-efficient than hex for multi-input txs). Accepts an optional
+/// `xmr-txunsigned:` text prefix for hex-encoded payloads.
+pub fn parse_unsigned_tx_set_bytes(
+    qr_data: &[u8],
+    view_pub: &Point,
+) -> Result<UnsignedTxSet, TxSetError> {
+    let data: &[u8] = match qr_data.strip_prefix(b"xmr-txunsigned:") {
+        Some(rest) => rest,
+        None => qr_data,
+    };
+    // If the payload is all ASCII hex chars, it's the hex form; decode it.
+    // Otherwise treat it as the raw envelope bytes.
+    let raw = if !data.is_empty() && data.iter().all(|b| b.is_ascii_hexdigit()) {
+        hex::decode(data).map_err(|e| TxSetError::Decode(e.to_string()))?
+    } else {
+        data.to_vec()
+    };
+    parse_envelope(&raw, view_pub)
+}
+
+/// The shared envelope parse: magic/version/destinations/payload/signature,
+/// Schnorr verification with the wallet's public view key, then
+/// `SignableTransaction::read`. Refuses anything not signed by this wallet.
+fn parse_envelope(raw: &[u8], view_pub: &Point) -> Result<UnsignedTxSet, TxSetError> {
     // Magic + version.
     if raw.len() < 18 + 1 + 4 + 4 + 64 {
         return Err(TxSetError::InvalidEnvelope("payload too short".into()));
@@ -381,6 +409,45 @@ mod tests {
         // authenticate first (it will fail at parse, not at auth).
         let err = parsed.err().expect("dummy payload must fail to parse");
         assert!(matches!(err, TxSetError::Parse(_)), "expected parse error, got {err:?}");
+    }
+
+    /// The raw-bytes entry point parses the same envelope (binary QR path).
+    #[test]
+    fn bytes_entry_point_parses_envelope() {
+        let w = wallet();
+        let destinations = vec![(w.subaddress(0, 0), 1_200_000_000_000u64)];
+        let payload = vec![0xabu8; 128];
+
+        let encoded = encode_unsigned_tx_set(&destinations, &payload, w.view_key()).unwrap();
+        let raw = hex::decode(encoded.strip_prefix("xmr-txunsigned:").unwrap()).unwrap();
+
+        // Raw bytes: must fail at PARSE (auth passed, dummy payload invalid),
+        // proving auth + structure are handled identically to the string path.
+        println!("DBG1 len={} magic_ok={}", raw.len(), &raw[..18] == b"xmxx-txunsigned-v1");
+        println!("DBG1 count={} addr_len={}", u32::from_le_bytes(raw[19..23].try_into().unwrap()), raw[23]);
+        println!("DBG1 addr={}", String::from_utf8_lossy(&raw[24..119]));
+        println!("DBG1 real={}", destinations[0].0);
+        let err = parse_unsigned_tx_set_bytes(&raw, &w.view_public_point())
+            .err()
+            .expect("dummy payload must fail to parse");
+        assert!(matches!(err, TxSetError::Parse(_)), "got {err:?}");
+
+        // Tampered raw bytes must fail authentication. Tamper a PAYLOAD byte
+        // (a destination-address byte is rejected by address validation before
+        // the signature check, which is a different error path).
+        let payload_start = 19 + 4 + (1 + 95 + 8) + 4;
+        let mut tampered = raw.clone();
+        tampered[payload_start] ^= 0x01;
+        let err2 = parse_unsigned_tx_set_bytes(&tampered, &w.view_public_point())
+            .err()
+            .expect("tampered raw must fail");
+        assert!(matches!(err2, TxSetError::AuthenticationFailed), "got {err2:?}");
+
+        // The hex-prefixed form through the bytes entry must also work.
+        let err3 = parse_unsigned_tx_set_bytes(encoded.as_bytes(), &w.view_public_point())
+            .err()
+            .expect("hex form through bytes entry must fail at parse");
+        assert!(matches!(err3, TxSetError::Parse(_)), "got {err3:?}");
     }
 
     /// Tampering with any byte of the envelope must fail authentication.
