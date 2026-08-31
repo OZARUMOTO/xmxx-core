@@ -39,6 +39,28 @@ mnemonic (see `wallet::spend_mnemonic`).
 
 Implementation: `wallet::MoneroWallet::derive` / `::subaddress` / `::spend_mnemonic`.
 
+### Integrated addresses / payment IDs
+
+Monero mainnet integrated addresses (network byte `0x13`) embed an 8-byte
+payment ID between the public keys and the checksum (77 bytes total). The
+on-chain destination is the **same** spend/view public keys as the standard
+address — the payment ID is only carried in the tx extra when sending.
+
+```
+integrated = 0x13 ‖ spend_pub(32) ‖ view_pub(32) ‖ payment_id(8) ‖ keccak256(checksum)
+```
+
+- `validate_address` accepts `0x13` integrated addresses (77 bytes) in addition
+  to standard (`0x12`) and subaddress (`0x2A`).
+- `integrated_payment_id(addr) -> Option<[u8;8]>` returns the embedded payment
+  ID.
+- On the send path, signing an integrated destination (`MoneroAddress` carries
+  the payment ID) makes `monero-wallet` encrypt it into the tx extra — the
+  payment ID flows to the recipient without changing the on-chain keys.
+
+Implementation: `wallet::encode_integrated_address` / `integrated_payment_id`;
+send path in the companion (`Address::from_str` preserves the payment ID).
+
 ### `xmr-output`
 
 The companion tells the signer which on-chain one-time outputs are available to
@@ -89,22 +111,31 @@ The companion presents an unsigned transaction for review + signing.
 request: xmr-txunsigned:<hex>
 ```
 
-The payload is an **authenticated envelope** around monero-wallet's native
-`SignableTransaction` serialization (inputs with decoys + commitments,
+The payload is an **encrypted and authenticated envelope** around monero-wallet's
+native `SignableTransaction` serialization (inputs with decoys + commitments,
 payments, fee rate — the actual object the signer will sign):
 
 ```
-magic "xmxx-txunsigned-v1" ‖ version(1)
-‖ destinations ‖ payload
-‖ sig(64)   Schnorr over keccak256(destinations ‖ payload), view keypair
+magic "xmxx-txunsigned-v2" ‖ version(1)
+‖ dest_enc(XChaCha20-Poly1305) ‖ payload
+‖ sig(64)   Schnorr over keccak256(dest_enc ‖ payload), view keypair
 ```
 
-- `destinations` — the review summary: `count ‖ (addr_len ‖ address ‖ amount)*`.
+- `dest_enc` — the review summary `count ‖ (addr_len ‖ address ‖ amount)*`,
+  **encrypted** with XChaCha20-Poly1305 keyed by
+  `keccak256("xmxx-destinations-key" ‖ private_view_key)` (nonce derived the
+  same way, AAD = the payload). This gives the recipient + amount
+  **confidentiality** on the wire: a camera/observer reading the QR sees only
+  ciphertext. Only the companion and the device (both hold the private view
+  key) can read it.
 - `payload` — `SignableTransaction::serialize()`.
 - `sig` — Monero's Schnorr signature (`crypto.cpp generate_signature`), with a
   deterministic nonce so the device needs no RNG. Verifying it proves the data
   is unmodified **and** that the sender holds this wallet's view key — the
   "is this my wallet?" test (the same auth model as wallet2's unsigned_tx_set).
+  Because the signature is over the *ciphertext*, tampering with either the
+  encrypted destinations or the payload is caught by the signature (or the
+  AEAD tag), whichever fires first.
 
 Implementation: `txset::parse_unsigned_tx_set` (companion-side builder:
 `txset::encode_unsigned_tx_set`).
@@ -136,6 +167,11 @@ failure is a hard error.
 - **The unsigned set is authenticated.** A transaction not signed by this
   wallet's view key is rejected before any parsing — so a foreign or tampered
   set cannot reach the review screen.
+
+- **The destinations are confidential.** The recipient + amount are
+  XChaCha20-Poly1305-encrypted with a key derived from the private view key.
+  Only the companion and the device can read them; the wire/QR carries
+  ciphertext only.
 - **What you review is what you sign.** The review shows the fee recomputed
   on-device from the actual object (`necessary_fee`), the payload fingerprint,
   and the authenticated destination summary. The destination *intent* is

@@ -15,9 +15,18 @@ vetted library code, not hand-rolled.
 |---|---|---|
 | `wallet` | `xmr-address` | SLIP-0010 `m/44'/128'/account'` derivation, subaddresses, **25-word mnemonic export** |
 | `keyimage` | `xmr-keyimage` | one-time key derivation + double-spend proofs, **ownership-asserted** |
-| `txset` | `xmr-txunsigned` / `xmr-txsigned` | **authenticated** unsigned-set envelope, review, deterministic CLSAG signing |
+| `txset` | `xmr-txunsigned` / `xmr-txsigned` | **encrypted + authenticated** unsigned-set envelope, review, deterministic CLSAG signing |
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the exact `xmr-*` wire formats.
+
+The `xmr-txunsigned` envelope (v2) is not just authenticated — the destination
+summary (recipient + amount) is **XChaCha20-Poly1305-encrypted** keyed by the
+private view key, so a camera/observer reading the QR sees only ciphertext.
+The key image path, review, and signing are unchanged.
+
+Integrated addresses (8-byte payment IDs) are supported: `validate_address`
+accepts the `0x13` form, `integrated_payment_id` extracts the embedded ID, and
+signing an integrated destination carries the payment ID into the tx extra.
 
 ## What changed in 0.2.0 (why you can trust this now)
 
